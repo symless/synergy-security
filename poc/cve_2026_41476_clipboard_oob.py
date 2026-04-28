@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Synergy clipboard unmarshall out-of-bounds read — CVE-2026-41476.
+CVE-2026-41476 — Synergy clipboard unmarshall out-of-bounds read.
 
 The deserializer at src/lib/deskflow/IClipboard.cpp::IClipboard::unmarshall
 reads a `size` field from the wire and constructs `String(index, size)`

